@@ -1,0 +1,124 @@
+terraform {
+  required_providers {
+    azurerm = {
+      source = "hashicorp/azurerm"
+      version = "4.10.0"
+    }
+  }
+}
+
+provider "azurerm" {
+  features {}
+  subscription_id = "18bf6d23-f170-4215-be50-32d8ce4d7736" # Uncomment and update as needed
+}
+
+# Reference the existing Resource Group
+data "azurerm_resource_group" "tfe_rg" {
+  name = "rg_npe_ast_dev_westus2_tfe2"
+}
+
+# Reference the existing Storage Account
+data "azurerm_storage_account" "tfe_sa" {
+  name                = "tfedevsaa"
+  resource_group_name = data.azurerm_resource_group.tfe_rg.name
+}
+
+data "azurerm_postgresql_flexible_server" "tfe_postgresql_fs" {
+  name                = "tfe-dev-po"
+  resource_group_name = data.azurerm_resource_group.tfe_rg.name
+}
+
+resource "azurerm_data_protection_backup_vault" "tfe_backup_storagevault" {
+  name                = "tfe-backup-vault-storage"
+  resource_group_name = data.azurerm_resource_group.tfe_rg.name
+  location            = data.azurerm_resource_group.tfe_rg.location
+  datastore_type      = "VaultStore"
+  redundancy          = "LocallyRedundant"
+  retention_duration_in_days = 30
+  soft_delete = "Off"
+  identity {
+    type = "SystemAssigned"
+    }
+}
+
+resource "azurerm_role_assignment" "tfe_storage_backup_contributor" {
+  scope                = data.azurerm_storage_account.tfe_sa.id
+  role_definition_name = "Storage Account Backup Contributor"
+  principal_id         = azurerm_data_protection_backup_vault.tfe_backup_storagevault.identity[0].principal_id
+}
+
+
+# resource "azurerm_data_protection_backup_policy_blob_storage" "tfe_blob_backup_policy" {
+#   name               = "tfe-backup-policy"
+#   vault_id           = azurerm_data_protection_backup_vault.tfe_backup_storagevault.id
+#   operational_default_retention_duration = "P30D"
+# }
+
+resource "azurerm_data_protection_backup_policy_blob_storage" "tfe_blob_backup_policy" {
+  name               = "tfe-backup-policy-storage"
+  vault_id           = azurerm_data_protection_backup_vault.tfe_backup_storagevault.id
+  backup_repeating_time_intervals = ["R/2021-05-23T05:00:00+00:00/P1W"]
+  time_zone                       = "America/Chicago"  # CST Time Zone
+  operational_default_retention_duration = "P30D"
+}
+
+resource "azurerm_data_protection_backup_instance_blob_storage" "tfe_blob_backup_instance" {
+  name               = "tfe-backup-instance-storage"
+  vault_id           = azurerm_data_protection_backup_vault.tfe_backup_storagevault.id
+  location           = data.azurerm_resource_group.tfe_rg.location
+  storage_account_id = data.azurerm_storage_account.tfe_sa.id
+  backup_policy_id   = azurerm_data_protection_backup_policy_blob_storage.tfe_blob_backup_policy.id
+
+  depends_on = [azurerm_role_assignment.tfe_storage_backup_contributor]
+}
+
+resource "azurerm_data_protection_backup_vault" "tfe_postgresql_backup_vault" {
+  name                = "tfe-backup-vault-postgreSQLfs"
+  resource_group_name = data.azurerm_resource_group.tfe_rg.name
+  location            = data.azurerm_resource_group.tfe_rg.location
+  datastore_type      = "VaultStore"
+  redundancy          = "LocallyRedundant"
+  retention_duration_in_days = 30
+  soft_delete = "Off"
+  identity {
+    type = "SystemAssigned"
+  }
+}
+
+#DONE
+
+resource "azurerm_data_protection_backup_policy_postgresql_flexible_server" "tfe_backup_policy_postgreSQLfs" {
+  name                            = "tfe-backup-policy-postgreSQLfs"
+  vault_id                        = azurerm_data_protection_backup_vault.tfe_postgresql_backup_vault.id
+  backup_repeating_time_intervals = ["R/2021-05-23T05:00:00+00:00/P1W"]
+  time_zone                       = "America/Chicago"  # CST Time Zone
+
+  default_retention_rule {
+    life_cycle {
+      duration        = "P30D"
+      data_store_type = "VaultStore"
+    }
+  }
+}
+
+# Role Assignment for the Resource Group
+resource "azurerm_role_assignment" "tfe_role_assignment_rg" {
+  scope                = data.azurerm_resource_group.tfe_rg.id
+  role_definition_name = "Reader"
+  principal_id         = azurerm_data_protection_backup_vault.tfe_postgresql_backup_vault.identity.0.principal_id
+}
+
+# Role Assignment for PostgreSQL Flexible Server
+resource "azurerm_role_assignment" "tfe_role_assignment_postgresql" {
+  scope                = data.azurerm_postgresql_flexible_server.tfe_postgresql_fs.id
+  role_definition_name = "PostgreSQL Flexible Server Long Term Retention Backup Role"
+  principal_id         = azurerm_data_protection_backup_vault.tfe_postgresql_backup_vault.identity.0.principal_id
+}
+
+resource "azurerm_data_protection_backup_instance_postgresql_flexible_server" "tfe_backup_instance_postgresql" {
+  name             = "tfe-dbi"
+  location         = data.azurerm_resource_group.tfe_rg.location
+  vault_id         = azurerm_data_protection_backup_vault.tfe_postgresql_backup_vault.id
+  server_id        = data.azurerm_postgresql_flexible_server.tfe_postgresql_fs.id
+  backup_policy_id = azurerm_data_protection_backup_policy_postgresql_flexible_server.tfe_backup_policy_postgreSQLfs.id
+}
